@@ -15,12 +15,19 @@
 //*****************************************************************************
 
 #include <cstring>
+#include <cstddef>
+#include <cstdint>
 #include <fstream>
+#include <functional>
+#include <iterator>
+#include <numeric>
+#include <utility>
 
 #include <gtest/gtest.h>
 #include <onnxifi.h>
 
 #include "ngraph/runtime/backend_manager.hpp"
+#include "ngraph/test/util/ndarray.hpp"
 
 // ===============================================[ onnxGetBackendIDs ] =======
 
@@ -635,9 +642,9 @@ namespace
         return result;
     }
 
-    std::vector<char> load_model()
+    std::vector<char> load_model(const std::string& model_relative_path)
     {
-        std::ifstream sin{SERIALIZED_ZOO "/onnx/add_abc.onnx", std::ios::ate | std::ios::binary};
+        std::ifstream sin{SERIALIZED_ZOO + model_relative_path, std::ios::ate | std::ios::binary};
         if (!sin.is_open())
         {
             throw std::runtime_error{"unable to load the model"};
@@ -653,7 +660,7 @@ namespace
 
 TEST(onnxifi, init_graph)
 {
-    auto model = load_model();
+    auto model = load_model("/onnx/add_abc.onnx");
     auto backends = get_initialized_backends();
     for (const auto& backend : backends)
     {
@@ -669,7 +676,7 @@ TEST(onnxifi, init_graph)
 
 TEST(onnxifi, init_graph_invalid_backend)
 {
-    auto model = load_model();
+    auto model = load_model("/onnx/add_abc.onnx");
     ::onnxGraph graph;
     ::onnxStatus status{
         ::onnxInitGraph(nullptr, nullptr, model.size(), model.data(), 0, nullptr, &graph)};
@@ -683,7 +690,7 @@ TEST(onnxifi, init_graph_invalid_backend)
 
 TEST(onnxifi, init_graph_invalid_pointer)
 {
-    auto model = load_model();
+    auto model = load_model("/onnx/add_abc.onnx");
     auto backends = get_initialized_backends();
 
     ::onnxGraph graph;
@@ -711,7 +718,7 @@ TEST(onnxifi, init_graph_invalid_pointer)
 
 TEST(onnxifi, init_graph_invalid_size)
 {
-    auto model = load_model();
+    auto model = load_model("/onnx/add_abc.onnx");
     auto backends = get_initialized_backends();
 
     ::onnxGraph graph;
@@ -742,299 +749,228 @@ TEST(onnxifi, init_graph_invalid_protobuf)
     }
 }
 
-// ================================================[ onnxReleaseBackend ]=======
-
-TEST(onnxifi, release_backend)
-{
-    auto backends = get_initialized_backends();
-    for (auto& backend : backends)
-    {
-        EXPECT_TRUE(::onnxReleaseBackend(backend) == ONNXIFI_STATUS_SUCCESS);
-    }
-}
-
-// ONNXIFI_STATUS_INVALID_BACKEND
-// The function call failed because backend is not an ONNXIFI backend handle.
-
-TEST(onnxifi, release_backend_invalid_backend)
-{
-    EXPECT_TRUE(::onnxReleaseBackend(nullptr) == ONNXIFI_STATUS_INVALID_BACKEND);
-}
-
-// ==============================================[ onnxReleaseBackendID ]=======
-
-TEST(onnxifi, release_backend_id)
-{
-    auto backend_ids = get_backend_ids();
-    for (auto& backend_id : backend_ids)
-    {
-        EXPECT_TRUE(::onnxReleaseBackendID(backend_id) == ONNXIFI_STATUS_SUCCESS);
-    }
-}
-
-// ONNXIFI_STATUS_INVALID_ID
-// The function call failed because backendID is not an ONNXIFI backend ID.
-
-TEST(onnxifi, release_backend_id_invalid_backend)
-{
-    EXPECT_TRUE(::onnxReleaseBackendID(nullptr) == ONNXIFI_STATUS_INVALID_ID);
-
-// ====================================================[ onnxRunGraph ]========
-
 namespace
 {
-    onnxMemoryFenceV1 get_default_memory_fence(::onnxBackend backend)
+    using std::pair<std::vector<::onnxTensorDescriptorV1>, std::string> = ModelWithTensors;
+
+    ::onnxTensorDescriptorV1
+        create_tensor_descriptor(const std::string& tensor_name,
+                                 uint32_t dimensions_count,
+                                 void* tensor_data_shape,
+                                 void* tensor_data,
+                                 uint64_t tensor_data_type = ONNXIFI_DATATYPE_FLOAT32,
+                                 uint64_t memory_type = ONNXIFI_MEMORY_TYPE_CPU)
     {
-        ::onnxEvent event;
-        EXPECT_TRUE(::onnxInitEvent(backend, &event) == ONNXIFI_STATUS_SUCCESS);
-        return {ONNXIFI_TAG_MEMORY_FENCE_V1, ONNXIFI_SYNCHRONIZATION_EVENT, event};
+        return ::onnxTensorDescriptorV1{
+            ONNXIFI_TAG_TENSOR_DESCRIPTOR_V1, // tag
+            tensor_name.c_str(),              // name - correspond to ValueInfoProto.name in one of
+                                              // ModelProto.graph.input or ModelProto.graph.output
+            tensor_data_type,                 // dataType
+            memory_type,                      // memoryType
+            dimensions_count,                 // dimensions
+            tensor_data_shape,                // shape
+            reinterpret_cast<::onnxPointer>(tensor_data) // buffer
+        };
     }
 
+    ModelWithTensors get_default_model_with_tensor_descriptors()
+    {
+        std::vector<char> serialized_model{load_model("onnx/conv_with_strides_padding_bias.onnx")};
+        std::vector<::onnxTensorDescriptorV1> tensor_descriptors{};
+
+        // ---- input ----
+        // uint32_t weights_count{35};
+        std::vector<uint64_t> input_data_shape{1, 1, 7, 5};
+        auto input_data{test::NDArray<float, 4>({{{{0, 1, 2, 3, 4},
+                                                   {5, 6, 7, 8, 9},
+                                                   {10, 11, 12, 13, 14},
+                                                   {15, 16, 17, 18, 19},
+                                                   {20, 21, 22, 23, 24},
+                                                   {25, 26, 27, 28, 29},
+                                                   {30, 31, 32, 33, 34}}}})
+                            .get_vector()};
+        tensor_descriptors.push_back(
+            create_tensor_descriptor("A", 4, input_data_shape.data(), input_data.data()));
+
+        // ---- weights ----
+        // uint32_t weights_count{9};
+        std::vector<uint64_t> weights_data_shape{1, 1, 3, 3};
+        auto weights_data{
+            test::NDArray<float, 4>({{{1, 1, 1}, {1, 1, 1}, {1, 1, 1}}}).get_vector()};
+        tensor_descriptors.push_back(
+            create_tensor_descriptor("B", 4, weights_data_shape.data(), weights_data.data()));
+
+        // ---- bias ----
+        // uint32_t weights_count{1};
+        std::vector<uint64_t> bias_data_shape{1};
+        std::vector<float> bias_data{2};
+        tensor_descriptors.push_back(
+            create_tensor_descriptor("C", 0, bias_data_shape.data(), bias_data.data()));
+
+        return std::make_pair(tensor_descriptors, serialized_model);
+    }
+
+    uint32_t get_tensor_descriptors_weights_count(
+        const std::vector<::onnxTensorDescriptorV1>& tensor_descriptors)
+    {
+        uint32_t weights_count{0};
+        for (const auto& td : tensor_descriptors)
+        {
+            weights_count +=
+                std::accumulate(td.shape, td.shape + td.dimensions, 0, std::plus<uint32_t>());
+        }
+        return weights_count;
+    }
 } // namespace  anonymous
 
-TEST(onnxifi, run_graph)
-{
-    auto model = load_model();
-    auto backends = get_initialized_backends();
+// ONNXIFI_STATUS_INVALID_SHAPE
+// The function call failed because one of the shape dimensions in weightDescriptors is 0.
 
+TEST(onnxifi, init_graph_invalid_shape)
+{
+    auto backends = get_initialized_backends();
+    auto model_with_tensors = get_default_model_with_tensor_descriptors();
+    auto tensor_descriptors = model_with_tensors.first;
+    auto serialized_model = model_with_tensors.second;
+    uint32_t weights_count{get_tensor_descriptors_weights_count(tensor_descriptors)};
+
+    // weights tensor_descriptors first shape dimension to be zero
+    tensor_descriptors.at(0).shape[0] = 0;
+
+    ::onnxGraph graph;
     for (const auto& backend : backends)
     {
-        ::onnxGraph graph;
-        EXPECT_TRUE(
-            ::onnxInitGraph(backend, nullptr, model.size(), model.data(), 0, nullptr, &graph) ==
-
-                ONNXIFI_STATUS_SUCCESS);
-        EXPECT_TRUE(::onnxReleaseGraph(graph) == ONNXIFI_STATUS_SUCCESS);
-            ONNXIFI_STATUS_SUCCESS);
-
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-
-        EXPECT_TRUE(::onnxRunGraph(backend, &input_fence, &output_fence) == ONNXIFI_STATUS_SUCCESS);
-        EXPECT_TRUE(::onnxWaitEvent(output_fence.event) == ONNXIFI_STATUS_SUCCESS);
+        ::onnxStatus status{::onnxInitGraph(backend,
+                                            nullptr,
+                                            serialized_model.size(),
+                                            serialized_model.data(),
+                                            weights_count,
+                                            tensor_descriptors.data(),
+                                            &graph)};
+        EXPECT_TRUE(status == ONNXIFI_STATUS_INVALID_SHAPE);
+        EXPECT_TRUE(graph == nullptr);
     }
 }
 
-TEST(onnxifi, run_graph)
+// ONNXIFI_STATUS_INVALID_MEMORY_LOCATION
+// The function call failed because one of the memory locations in weightDescriptors
+// is invalid (NULL pointer).
+
+TEST(onnxifi, init_graph_invalid_memory_location)
 {
-    auto model = load_model();
     auto backends = get_initialized_backends();
+    auto model_with_tensors = get_default_model_with_tensor_descriptors();
+    auto tensor_descriptors = model_with_tensors.first;
+    auto serialized_model = model_with_tensors.second;
+    uint32_t weights_count{get_tensor_descriptors_weights_count(tensor_descriptors)};
+
+    auto buffer = tensor_descriptors.at(0).buffer;
+    tensor_descriptors.at(0).buffer = nullptr;
+
+    ::onnxGraph graph;
+    for (const auto& backend : backends)
+    {
+        ::onnxStatus status{::onnxInitGraph(backend,
+                                            nullptr,
+                                            serialized_model.size(),
+                                            serialized_model.data(),
+                                            weights_count,
+                                            tensor_descriptors.data(),
+                                            &graph)};
+        EXPECT_TRUE(status == ONNXIFI_STATUS_INVALID_MEMORY_LOCATION);
+        EXPECT_TRUE(graph == nullptr);
+    }
+
+    tensor_descriptors.at(0).buffer = buffer;
+    auto shape = tensor_descriptors.at(0).shape;
+    tensor_descriptors.at(0).shape = nullptr;
 
     for (const auto& backend : backends)
     {
-        ::onnxGraph graph;
-        EXPECT_TRUE(
-            ::onnxInitGraph(backend, nullptr, model.size(), model.data(), 0, nullptr, &graph) ==
-            ONNXIFI_STATUS_SUCCESS);
+        ::onnxStatus status{::onnxInitGraph(backend,
+                                            nullptr,
+                                            serialized_model.size(),
+                                            serialized_model.data(),
+                                            weights_count,
+                                            tensor_descriptors.data(),
+                                            &graph)};
+        EXPECT_TRUE(status == ONNXIFI_STATUS_INVALID_MEMORY_LOCATION);
+        EXPECT_TRUE(graph == nullptr);
+    }
 
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-      
-        EXPECT_TRUE(::onnxRunGraph(backend, &input_fence, &output_fence) == ONNXIFI_STATUS_SUCCESS);
-        EXPECT_TRUE(::onnxWaitEvent(output_fence.event) == ONNXIFI_STATUS_SUCCESS);      
+    tensor_descriptors.at(0).shape = shape;
+    auto name = tensor_descriptors.at(0).name;
+    tensor_descriptors.at(0).name = nullptr;
+
+    for (const auto& backend : backends)
+    {
+        ::onnxStatus status{::onnxInitGraph(backend,
+                                            nullptr,
+                                            serialized_model.size(),
+                                            serialized_model.data(),
+                                            weights_count,
+                                            tensor_descriptors.data(),
+                                            &graph)};
+        EXPECT_TRUE(status == ONNXIFI_STATUS_INVALID_MEMORY_LOCATION);
+        EXPECT_TRUE(graph == nullptr);
     }
 }
 
-// ONNXIFI_STATUS_INVALID_POINTER
-// The function call failed because inputFence or outputFence pointer is NULL.
+// ONNXIFI_STATUS_UNSUPPORTED_MEMORY_TYPE
+// The function call failed because one of the memory types in weightDescriptors is
+// different from ONNXIFI_MEMORY_TYPE_CPU.
 
-TEST(onnxifi, run_graph_invalid_pointer)
+TEST(onnxifi, init_graph_unsupported_memory_type)
 {
-    auto model = load_model();
     auto backends = get_initialized_backends();
+    auto model_with_tensors = get_default_model_with_tensor_descriptors();
+    auto tensor_descriptors = model_with_tensors.first;
+    auto serialized_model = model_with_tensors.second;
+    uint32_t weights_count{get_tensor_descriptors_weights_count(tensor_descriptors)};
 
+    tensor_descriptors.at(0).memoryType = ONNXIFI_MEMORY_TYPE_CUDA_BUFFER;
+
+    ::onnxGraph graph;
     for (const auto& backend : backends)
     {
-        ::onnxGraph graph;
-        EXPECT_TRUE(
-            ::onnxInitGraph(backend, nullptr, model.size(), model.data(), 0, nullptr, &graph) ==
-            ONNXIFI_STATUS_SUCCESS);
-
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-        EXPECT_TRUE(::onnxRunGraph(graph, &input_fence, nullptr) == ONNXIFI_STATUS_INVALID_POINTER);
-        EXPECT_TRUE(::onnxRunGraph(graph, nullptr, &output_fence) ==
-                    ONNXIFI_STATUS_INVALID_POINTER);
-
+        ::onnxStatus status{::onnxInitGraph(backend,
+                                            nullptr,
+                                            serialized_model.size(),
+                                            serialized_model.data(),
+                                            weights_count,
+                                            tensor_descriptors.data(),
+                                            &graph)};
+        EXPECT_TRUE(status == ONNXIFI_STATUS_UNSUPPORTED_MEMORY_TYPE);
+        EXPECT_TRUE(graph == nullptr);
     }
 }
 
-// ONNXIFI_STATUS_INVALID_GRAPH
-// The function call failed because graph is not an ONNXIFI graph handle.
+// ONNXIFI_STATUS_MISMATCHING_SHAPE
+// The function call failed because the shapes specified in weight descriptors do not match the
+// shapes specified in the ONNX model graph, or output or intermediate shapes specified in the ONNX
+// model graph do not match the shapes inferred from input shapes.
 
-TEST(onnxifi, release_graph_invalid_graph)
-{
-    EXPECT_TRUE(::onnxReleaseGraph(nullptr) == ONNXIFI_STATUS_INVALID_GRAPH);
-}
-  
-TEST(onnxifi, run_graph_invalid_graph)
-{
-    auto model = load_model();
-    auto backends = get_initialized_backends();
-
-    for (const auto& backend : backends)
-    {
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-        EXPECT_TRUE(::onnxRunGraph(nullptr, &input_fence, &output_fence) ==
-                    ONNXIFI_STATUS_INVALID_GRAPH);
-    }
-}
-
-// ONNXIFI_STATUS_INVALID_FENCE_TYPE
-// The function call failed because the type of synchronization primitive specified in inputFence
-// or outputFence is unknown to the backend.
-
-TEST(onnxifi, run_graph_invalid_fence)
-{
-    auto model = load_model();
-    auto backends = get_initialized_backends();
-
-    for (const auto& backend : backends)
-    {
-        ::onnxGraph graph;
-        EXPECT_TRUE(
-            ::onnxInitGraph(backend, nullptr, model.size(), model.data(), 0, nullptr, &graph) ==
-            ONNXIFI_STATUS_SUCCESS);
-
-        auto invalid_mem_fence = get_default_memory_fence(backend);
-        // According to specification type of memory synchronization primitive
-        // can accept two values:
-        //  ONNXIFI_SYNCHRONIZATION_EVENT 0
-        //  ONNXIFI_SYNCHRONIZATION_IMPLICIT 2
-        invalid_mem_fence.type = 0xFFFFFFFFFFFFFFFF;
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-        EXPECT_TRUE(::onnxRunGraph(graph, &invalid_mem_fence, &output_fence) ==
-                    ONNXIFI_STATUS_INVALID_FENCE_TYPE);
-        EXPECT_TRUE(::onnxRunGraph(graph, &input_fence, &invalid_mem_fence) ==
-                    ONNXIFI_STATUS_INVALID_FENCE_TYPE);
-    }
-}
-
-// ONNXIFI_STATUS_INVALID_EVENT
-// The function call failed because the memory synchronization primitive specified in inputFence or
-// outputFence is not valid (e.g. NULL onnxEvent).
-
-TEST(onnxifi, run_graph_invalid_event)
-{
-    auto model = load_model();
-    auto backends = get_initialized_backends();
-
-    for (const auto& backend : backends)
-    {
-        ::onnxGraph graph;
-        EXPECT_TRUE(
-            ::onnxInitGraph(backend, nullptr, model.size(), model.data(), 0, nullptr, &graph) ==
-            ONNXIFI_STATUS_SUCCESS);
-
-        auto invalid_event = get_default_memory_fence(backend);
-        invalid_event.event = nullptr;
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-        EXPECT_TRUE(::onnxRunGraph(graph, &invalid_event, &output_fence) ==
-                    ONNXIFI_STATUS_INVALID_EVENT);
-        EXPECT_TRUE(::onnxRunGraph(graph, &input_fence, &invalid_event) ==
-                    ONNXIFI_STATUS_INVALID_EVENT);
-    }
-}
-
-// ONNXIFI_STATUS_UNSUPPORTED_TAG
-// The function call failed because a tag in inputFence or outputFence is unknown to the backend
-// (tag does not match ONNXIFI_TAG_MEMORY_FENCE_V1).
-
-TEST(onnxifi, run_graph_invalid_mem_fence_tag)
-{
-    auto model = load_model();
-    auto backends = get_initialized_backends();
-
-    for (const auto& backend : backends)
-    {
-        ::onnxGraph graph;
-        EXPECT_TRUE(
-            ::onnxInitGraph(backend, nullptr, model.size(), model.data(), 0, nullptr, &graph) ==
-            ONNXIFI_STATUS_SUCCESS);
-
-        auto invalid_event = get_default_memory_fence(backend);
-        invalid_event.tag = 0;
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-        EXPECT_TRUE(::onnxRunGraph(graph, &invalid_event, &output_fence) ==
-                    ONNXIFI_STATUS_UNSUPPORTED_TAG);
-        EXPECT_TRUE(::onnxRunGraph(graph, &input_fence, &invalid_event) ==
-                    ONNXIFI_STATUS_UNSUPPORTED_TAG);
-    }
-}
-
-// ONNXIFI_STATUS_UNSUPPORTED_FENCE_TYPE
-// The function call failed because the backend does not support the type of synchronization
-// primitive specified in inputFence or outputFence.
-
-TEST(onnxifi, run_graph_unsupported_fence_type)
-{
-    auto model = load_model();
-    auto backends = get_initialized_backends();
-
-    for (const auto& backend : backends)
-    {
-        ::onnxGraph graph;
-        EXPECT_TRUE(
-            ::onnxInitGraph(backend, nullptr, model.size(), model.data(), 0, nullptr, &graph) ==
-            ONNXIFI_STATUS_SUCCESS);
-
-        auto unsupported_fence_type = get_default_memory_fence(backend);
-        unsupported_fence_type.type = ONNXIFI_SYNCHRONIZATION_IMPLICIT;
-        ::onnxMemoryFenceV1 input_fence{get_default_memory_fence(backend)};
-        ::onnxMemoryFenceV1 output_fence;
-        EXPECT_TRUE(::onnxRunGraph(graph, &unsupported_fence_type, &output_fence) ==
-                    ONNXIFI_STATUS_UNSUPPORTED_FENCE_TYPE);
-        EXPECT_TRUE(::onnxRunGraph(graph, &input_fence, &unsupported_fence_type) ==
-                    ONNXIFI_STATUS_UNSUPPORTED_FENCE_TYPE);
-    }
-}
-
-// ====================================================[ onnxWaitEvent ]========
-
-// ONNXIFI_STATUS_INVALID_EVENT
-// The function call failed because event is not an ONNXIFI event handle.
-
-TEST(onnxifi, wait_event_invalid_event)
-{
-    EXPECT_TRUE(::onnxWaitEvent(nullptr) == ONNXIFI_STATUS_INVALID_EVENT);
-}
-
-// ===================================================[ onnxSignalEvent ]=======
-
-TEST(onnxifi, signal_event)
+TEST(onnxifi, init_graph_mismatching_shape)
 {
     auto backends = get_initialized_backends();
+    auto model_with_tensors = get_default_model_with_tensor_descriptors();
+    auto tensor_descriptors = model_with_tensors.first;
+    auto serialized_model = model_with_tensors.second;
+    uint32_t weights_count{get_tensor_descriptors_weights_count(tensor_descriptors)};
+
+    tensor_descriptors.at(0).shape[0] = 100;
+
+    ::onnxGraph graph;
     for (const auto& backend : backends)
     {
-        ::onnxEvent event;
-        EXPECT_TRUE(::onnxInitEvent(backend, &event) == ONNXIFI_STATUS_SUCCESS);
-        EXPECT_TRUE(::onnxSignalEvent(event) == ONNXIFI_STATUS_SUCCESS);
-    }
-}
-
-// ONNXIFI_STATUS_INVALID_EVENT
-// The function call failed because event is not an ONNXIFI event handle.
-
-TEST(onnxifi, signal_event_invalid_event)
-{
-    EXPECT_TRUE(::onnxSignalEvent(nullptr) == ONNXIFI_STATUS_INVALID_EVENT);
-}
-
-// ONNXIFI_STATUS_INVALID_STATE
-// The function call failed because event is already in the signalled state.
-
-TEST(onnxifi, signal_event_invalid_state)
-{
-    auto backends = get_initialized_backends();
-    for (const auto& backend : backends)
-    {
-        ::onnxEvent event;
-        EXPECT_TRUE(::onnxInitEvent(backend, &event) == ONNXIFI_STATUS_SUCCESS);
-        EXPECT_TRUE(::onnxSignalEvent(event) == ONNXIFI_STATUS_SUCCESS);
-        EXPECT_TRUE(::onnxSignalEvent(event) == ONNXIFI_STATUS_INVALID_STATE);
+        ::onnxStatus status{::onnxInitGraph(backend,
+                                            nullptr,
+                                            serialized_model.size(),
+                                            serialized_model.data(),
+                                            weights_count,
+                                            tensor_descriptors.data(),
+                                            &graph)};
+        EXPECT_TRUE(status == ONNXIFI_STATUS_MISMATCHING_SHAPE);
+        EXPECT_TRUE(graph == nullptr);
     }
 }
